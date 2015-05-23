@@ -1,53 +1,65 @@
-#a super bare-bones method to track rankings in Amazon Search results
-
 from bs4 import BeautifulSoup
-from urllib2 import urlopen
+import urllib2
+import csv
 # import pandas as pd
-import re
+import time
 import lxml
 import sys
 import requests
+import re
+from retry import retry as _retry
 import pymongo
+
+#insert curated endpoints here
+from endpoints import Best_Amish, Category_Amish, Search_Amish
 
 reload(sys)
 sys.setdefaultencoding("utf-8")
 
-from endpoints_new7 import *
+prh_asin = ['xyz', 'abc']
 
+def iter_elements_extract_or_skip_attributes(elements, *attributes):
+    for element in elements:
+        values = tuple(element.get(att, None) for att in attributes)
+        if all(values):
+            yield values
+
+def check_asin(result_list):
+    new_result = [item for item in result_list if item[1] in prh_asin]
+    return new_result
+
+def remove_prefix(s, prefix):
+    assert s.startswith(prefix)
+    return s[len(prefix):]
+
+def convert_index(result_list):
+    getidx = lambda s: 1 + int(remove_prefix(s, 'result_'))
+    return [(getidx(s), asin) for s, asin in result_list]
+
+@_retry(urllib2.URLError, tries=4, delay=3, backoff=2)
+def urlopen_with_retry(url):
+    return urllib2.urlopen(url)
+
+@_retry(requests.ConnectionError, tries=4, delay=3, backoff=2)
+def request_with_retry(url):
+    return requests.get(url)
 
 def Amz_Search_Results(endpoint):
-#opens and parses the page
-	amz = urlopen(endpoint)
-	soup = BeautifulSoup(amz, "html.parser")
-	#searches for the li tag with results items in it
-	findone = BeautifulSoup(str(soup.find_all("li", class_="s-result-item")))
-	results = []
-	#find only the <id tag> with the results in them
-	for b in findone.find_all('li'):
-	    try:
-	    	#pulls only the result_number and asin
-	        x = b['id'], b['data-asin']
-	        results.append(x)
-	    except Exception:
-	        pass
-	return results
-
-#accounts for an alternate web page format
-def Amz_Search_Results_alt(endpoint):
-    amz = urlopen(endpoint)
+    amz = urlopen_with_retry(endpoint)
     soup = BeautifulSoup(amz, "lxml")
-    findtwo = BeautifulSoup(str(soup.find_all("div", attrs={"id": "mainResults"})))
-    results = []
-    for b in findtwo.find_all('div'):
-        try:
-            x = b['id'], b['name']
-            results.append(x)
-        except Exception:
-            pass
-    return results
+    findone = BeautifulSoup(str(soup.find_all("li", class_="s-result-item")))
+    elements = findone.find_all('li')
+    iter_data = iter_elements_extract_or_skip_attributes(elements, 'id', 'data-asin')
+    return [item for item in iter_data if item[1] in prh_asin]
 
-#pulls data from bestseller pages which are javascript pages
-#pulls via AJAX request and parses resonse. More URLS but fastser scrape
+def Amz_Search_Results_alt(endpoint):
+    amz = urlopen_with_retry(endpoint)
+    soup = BeautifulSoup(amz, "lxml")
+    findone = BeautifulSoup(str(soup.find_all("div", attrs={"id": "mainResults"})))
+    elements = findone.find_all('div')
+    iter_data = iter_elements_extract_or_skip_attributes(elements, 'id', 'name')
+    return [item for item in iter_data if item[1] in prh_asin]
+
 def Amz_bestseller(endpoint):
     r = requests.get(endpoint)
     soup = BeautifulSoup(str(r.text), "html")
@@ -62,10 +74,9 @@ def Amz_bestseller(endpoint):
     for b in findtwo.find_all("span", attrs={"class": "asinReviewsSummary acr-popover"}):
         x = b['name']
         asin_list.append(x)
-    final_result = zip(rank_list, asin_list, title_list)
+    final_result = check_asin(zip(rank_list, asin_list, title_list))
     return final_result
 
-#cycles through the bestseller request URLS
 def run_spider_bestseller(item_search):
     results_dict = {}
     #runs through the list of endpoints
@@ -73,55 +84,49 @@ def run_spider_bestseller(item_search):
         results = []
         for url in value:
             try:
+                time.sleep(0.5)
                 x = Amz_bestseller(url)
-                # if x == []:
-                #     x = Amz_Search_Results_alt(url)
                 results.extend(x)
-            except Exception:
-                pass
+            except Exception as e:
+                 print e
             results_dict[key] = results
     return results_dict
 
-#cycles through the Category and Search URLS
 def run_spider_run(item_search):
     results_dict = {}
-    #runs through the list of endpoints
     for key, value in item_search.iteritems():
         results = []
         for url in value:
-            try:
-                x = Amz_Search_Results(url)
-                #tests to see if the function is not pulling what we need
-                #if so, then it uses the alternate func
-                if x == []:
-                    x = Amz_Search_Results_alt(url)
-                results.extend(x)
-            except Exception:
-                pass
+            time.sleep(0.5)
+            x = Amz_Search_Results(url)
+            if x == []:
+                time.sleep(0.5)
+                x = Amz_Search_Results_alt(url)
+            results.extend(convert_index(x))
             results_dict[key] = results
     return results_dict
 
 def format_data(data_name, output):
-	#converts the dictionary of results into a dataframe just so we can turn it
-	#and easily output as csv file so others can play with it
-	df = pd.DataFrame.from_dict(data_name, orient='index')
-	new_df = df.transpose()
-	new_df.to_csv('title.csv')
-  
-result_bestseller = run_spider_bestseller(Best_Amish)
-conn_1 = pymongo.MongoClient()
-db = conn_1.amzdb
-collection_1 = db.amish_bestseller
-collection_1.insert(result_bestseller)
+    df = pd.DataFrame.from_dict(data_name, orient='index')
+    new_df = df.transpose()
+    new_df.to_csv('Bestseller_Amish_debug.csv')
 
-result_category = run_spider_bestseller(Category_Amish)
-conn_2 = pymongo.MongoClient()
-db = conn_2.amzdb
-collection_2 = db.amish_category
-collection_2.insert(result_category)
+if __name__ == "__main__":
 
-result_search = run_spider_bestseller(Search_Amish)
-conn_3 = pymongo.MongoClient()
-db = conn_3.amzdb
-collection_3 = db.amish_search
-collection_3.insert(result_search)
+    conn_1 = pymongo.MongoClient()
+    db = conn_1.amzdb
+    collection_1 = db.amish_bestseller
+    result_bestseller = run_spider_bestseller(Best_Amish)
+    collection_1.insert(result_bestseller)
+
+    conn_2 = pymongo.MongoClient()
+    db2 = conn_2.amzdb
+    collection_2 = db2.amish_category
+    result_category = run_spider_run(Category_Amish)
+    collection_2.insert(result_category)
+
+    conn_3 = pymongo.MongoClient()
+    db3 = conn_3.amzdb
+    collection_3 = db3.amish_search
+    result_search = run_spider_run(Search_Amish)
+    collection_3.insert(result_search)
